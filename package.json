@@ -1,0 +1,1 @@
+{"name":"jiexi","version":"1.0.0","private":true,"type":"module","description":"去水印解析服务（EdgeOne Pages Functions）","scripts":{"build":"node src/build.js","test":"node test/test-dist.mjs"}}
