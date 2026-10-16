@@ -249,7 +249,7 @@ const PARSE_TIMEOUT_MS = 20000;
 const PROXY_TIMEOUT_MS = 60000;
 
 const PROXY_TOKEN = '';
-const PARSER_VERSION = '2026.10.16.12';
+const PARSER_VERSION = '2026.10.16.13';
 
 // 本地可解析的平台（其它一律走兜底）
 const DOUYIN_RE = /douyin\.com|iesdouyin\.com|snssdk\.com|wtturl\.cn/i;
@@ -789,11 +789,14 @@ module.exports = {
 
   // ===== 媒体代理（/api/proxy）访问控制 =====
   //
-  // proxyAllowAll=true  → 关闭域名白名单（任何 http/https 都可代理）
-  //                       注意：这等于开放代理，有被盗刷流量的风险，
-  //                       仅建议在调试/自用阶段临时开启。
-  // proxyAllowAll=false → 只放行下面的白名单（推荐）
-  proxyAllowAll: /^(true|1|yes|on)$/i.test(String(env.PROXY_ALLOW_ALL || '').trim()),
+  // 默认放开：/api/proxy 不校验域名，任何 http/https 都可代理。
+  // 想恢复白名单校验，设环境变量 PROXY_ALLOW_ALL=false 即可。
+  // 注意：无论放开与否，内网/本机地址都会被 SSRF 防护拦掉（见 lib/proxy-guard.js）。
+  proxyAllowAll: (() => {
+    const raw = String(env.PROXY_ALLOW_ALL || '').trim();
+    if (!raw) return true; // 未设置 → 默认放开
+    return !/^(false|0|no|off)$/i.test(raw);
+  })(),
 
   // 额外放行的域名后缀（逗号分隔），用于临时补漏而不用改代码重新构建。
   // 例：export PROXY_EXTRA_HOSTS="foo-cdn.com,bar.video"
