@@ -249,7 +249,7 @@ const PARSE_TIMEOUT_MS = 20000;
 const PROXY_TIMEOUT_MS = 60000;
 
 const PROXY_TOKEN = '';
-const PARSER_VERSION = '2026.10.16.11';
+const PARSER_VERSION = '2026.10.16.12';
 
 // 本地可解析的平台（其它一律走兜底）
 const DOUYIN_RE = /douyin\.com|iesdouyin\.com|snssdk\.com|wtturl\.cn/i;
@@ -823,8 +823,8 @@ module.exports = {
     /(^|\.)(video|weishi)\.qq\.com$/i,
     /(^|\.)tc\.qq\.com$/i,
     /(^|\.)(myqcloud|tencent-cloud)\.(com|net)$/i,
-    // ---- 皮皮虾 / 皮皮搞笑 ----
-    /(^|\.)(ippzone|hjypbd|pipigx|baishancdn)\.(com|cn)$/i,
+    // ---- 皮皮虾 / 皮皮搞笑（视频走 ppxyvod，图片走 ippzone / hjypbd）----
+    /(^|\.)(ippzone|hjypbd|pipigx|baishancdn|ppxyvod|ppxs)\.(com|cn)$/i,
     // ---- 最右 ----
     /(^|\.)izuiyou\.(com|net)$/i,
     // ---- 美拍 ----
@@ -857,7 +857,7 @@ module.exports = {
     { test: /bilibili|bilivideo|hdslb|biliapi|acgvideo|bfsimg|akamaized/i, referer: 'https://www.bilibili.com/', origin: 'https://www.bilibili.com' },
     { test: /weibo|weibocdn|sinaimg|miaopai|sina\.com\.cn/i, referer: 'https://weibo.com/', origin: 'https://weibo.com' },
     { test: /qq\.com|qpic|gtimg|myqcloud|tencent-cloud|qcloudimg/i, referer: 'https://h5.weishi.qq.com/', origin: 'https://h5.weishi.qq.com' },
-    { test: /ippzone|hjypbd|pipigx|baishancdn/i, referer: 'https://www.ippzone.com/', origin: 'https://www.ippzone.com' },
+    { test: /ippzone|hjypbd|pipigx|baishancdn|ppxyvod|ppxs/i, referer: 'https://www.ippzone.com/', origin: 'https://www.ippzone.com' },
     { test: /izuiyou/i, referer: 'https://www.izuiyou.com/', origin: 'https://www.izuiyou.com' },
     { test: /meipai|meitudata/i, referer: 'https://www.meipai.com/', origin: 'https://www.meipai.com' },
     { test: /acfun/i, referer: 'https://www.acfun.cn/', origin: 'https://www.acfun.cn' },
