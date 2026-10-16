@@ -240,7 +240,6 @@ const refXhs = require('../server/parsers/ref/xhs');
 // 主服务（jiexi.kkkkm.com）解析不出来时，并发请求下面所有源，取最先成功的那个。
 const FALLBACK_BASES = [
   'https://qsy.kkkkm.com',
-  'https://qsy.kkkkm.qzz.io',
 ];
 const FALLBACK_PATH = '/api/parse';
 
@@ -249,7 +248,7 @@ const PARSE_TIMEOUT_MS = 20000;
 const PROXY_TIMEOUT_MS = 60000;
 
 const PROXY_TOKEN = '';
-const PARSER_VERSION = '2026.10.16.8';
+const PARSER_VERSION = '2026.10.16.9';
 
 // 本地可解析的平台（其它一律走兜底）
 const DOUYIN_RE = /douyin\.com|iesdouyin\.com|snssdk\.com|wtturl\.cn/i;

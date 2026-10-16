@@ -35,15 +35,11 @@ curl "https://<你的域名>/api/parse?url=<分享链接或口令>"
 ```js
 // edgeone/router.js
 const FALLBACK_BASES = [
-  'https://qsy.kkkkm.com',      // 主兜底
-  'https://qsy.kkkkm.qzz.io',   // 备用兜底
+  'https://qsy.kkkkm.com',
 ];
 ```
 
 新增/调整兜底源只需改这个数组。某源超时或报错会自动跳过（每个源 20s 超时）。
-
-> 注意：`qsy.kkkkm.qzz.io` 目前 TLS 握手失败（Cloudflare 证书/SSL 模式待处理），
-> 修好后会自动参与并发，不影响现有链路。
 
 ## 目录结构
 
