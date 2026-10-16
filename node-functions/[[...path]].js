@@ -1903,6 +1903,14 @@ const __handler = {
   },
 };
 
-export async function onRequest(context) {
-  return __handler.fetch(context.request);
-}
+export const onRequest = async (context) => {
+  const { request, env } = context;
+  try {
+    return await __handler.fetch(request);
+  } catch (err) {
+    return new Response(JSON.stringify({ ok: false, code: 500, message: String((err && err.message) || err) }), {
+      status: 200,
+      headers: { 'content-type': 'application/json; charset=utf-8' },
+    });
+  }
+};

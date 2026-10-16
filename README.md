@@ -20,27 +20,28 @@ curl "https://<你的域名>/api/parse?url=<分享链接或口令>"
 
 返回字段：`code`、`data.title`、`data.url`、`data.cover`、`data.vs[]`（多清晰度）、`data.audioUrl`、`data.e`（过期时间戳 ms）、`data._source`（local / fallback）。
 
-## 部署（EdgeOne Pages）
+## 目录结构
 
-1. 在 EdgeOne 控制台 → **Makers / 项目** → 创建项目 → 选择本 GitHub 仓库（`waimaime/jiexi`）。
-2. 配置：
+```
+edgeone.json                      # 部署清单（输出目录 + 路由重写）
+public/index.html                 # 静态落地页（输出目录）
+node-functions/index.js           # 根路由 「/」
+node-functions/[[...path]].js     # 全捕获路由 「/*」（解析 / 代理接口）
+```
+
+## 部署（EdgeOne Pages / Makers）
+
+1. 控制台 → **Makers / 项目** → 创建项目 → 选择 GitHub 仓库 `waimaime/jiexi`。
+2. 配置项：
    - 框架预设：**Other**
    - 根目录：`/`
    - **输出目录：`public`**
-   - **构建命令：留空**
+   - **构建命令：留空**（仓库内 `npm run build` 为空操作，不会失败）
    - **安装命令：留空**
-3. 入口为 `functions/[[default]].js`（EdgeOne Pages Functions 约定的全捕获路由），自动识别，无需额外构建。
+3. 点「开始部署」，`edgeone.json` 会自动把 `/` 和 `/*` 重写到 Node Functions。
 
-## 本地开发 / 构建
-
-`src/build.js` 会将 `src/router.js`（及其依赖）打包并注入纯 JS MD5（EdgeOne 无 node:crypto），输出 `dist/index.js`：
-
-```bash
-npm run build
-node test/test-dist.mjs   # 16 项冒烟测试
-```
-
-`functions/[[default]].js` 为构建产物的部署副本，修改 `src/` 后需重新构建并同步。
+> 说明：EdgeOne Pages 与 Cloudflare Pages 的 `functions/` 约定不同，
+> 官方要求 Node 函数放在 `./node-functions`、边缘函数放在 `./edge-functions`。
 
 ## 说明
 
