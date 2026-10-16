@@ -414,15 +414,26 @@ async function parseFallback(text) {
   }
 }
 
-async function handleParse(req) {
-  let body;
-  try {
-    body = await req.json();
-  } catch (e) {
-    throw new HttpError('请求体不是合法 JSON', 400);
+async function handleParse(req, url) {
+  let text;
+  if (req.method === 'GET') {
+    text = (url.searchParams.get('url') || url.searchParams.get('text') || url.searchParams.get('u') || '').trim();
+  } else {
+    let body;
+    try {
+      body = await req.json();
+    } catch (e) {
+      try {
+        body = Object.fromEntries(new URLSearchParams(await req.text()));
+      } catch (e2) {
+        body = null;
+      }
+    }
+    body = body || {};
+    if (url && url.searchParams.get('url')) body.url = url.searchParams.get('url');
+    text = String(body.text || body.url || body.u || '').trim();
   }
-  const text = body && (body.text || body.url || body.u);
-  const shareUrl = extractUrl(text) || String(text || '').trim();
+  const shareUrl = extractUrl(text) || text;
   if (!shareUrl) throw new HttpError('请先粘贴分享链接', 400);
 
   // 1) 本地解析（抖音 / B站）
@@ -506,19 +517,31 @@ async function handleProxy(req, url) {
 
 /* ---------------- 路由入口 ---------------- */
 
+// EdgeOne Pages 重写后可能把函数路径透传给脚本，这里做一层还原
+function normalizePath(pathname) {
+  let p = String(pathname || '/');
+  if (p.includes('/node-functions/') || p.includes('/edge-functions/')) {
+    const m = p.match(/\/(?:node|edge)-functions\/[^/]*?\.js(\/[^?]*)?$/);
+    if (m && m[1]) p = m[1];
+    else p = '/';
+  }
+  return p;
+}
+
 async function handle(req, context) {
   const url = new URL(req.url);
+  const pathname = normalizePath(url.pathname);
   try {
     if (req.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
-    if (url.pathname === '/api/health') {
+    if (pathname === '/api/health') {
       return json({ ok: true, runtime: 'edgeone-edge-function' });
     }
-    if (url.pathname === '/api/version') {
+    if (pathname === '/api/version') {
       return json({ ok: true, parserVersion: PARSER_VERSION, apiVersion: 'wx_1.0.0', serverTime: Date.now() });
     }
-    if (url.pathname === '/api/config') {
+    if (pathname === '/api/config') {
       return json({
         ok: true,
         data: {
@@ -533,13 +556,14 @@ async function handle(req, context) {
         },
       });
     }
-    if (url.pathname === '/api/parse' && (req.method === 'POST' || req.method === 'PUT')) {
-      return await handleParse(req);
+    const isParse = pathname === '/api/parse' || pathname === '/api/dewatermark/parseurl' || pathname === '/parse';
+    if (isParse) {
+      return await handleParse(req, url);
     }
-    if (url.pathname === '/api/proxy' && req.method === 'GET') {
+    if (pathname === '/api/proxy' && req.method === 'GET') {
       return await handleProxy(req, url);
     }
-    if (url.pathname === '/') {
+    if (pathname === '/') {
       return json({
         ok: true,
         service: 'watermark-tool',
