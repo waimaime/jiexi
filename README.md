@@ -23,8 +23,13 @@ curl "https://<你的域名>/api/parse?url=<分享链接或口令>"
 ## 部署（EdgeOne Pages）
 
 1. 在 EdgeOne 控制台 → **Makers / 项目** → 创建项目 → 选择本 GitHub 仓库（`waimaime/jiexi`）。
-2. 框架预设选「无 / 其他」即可，构建命令留空。
-3. 入口为 `functions/[[default]].js`（EdgeOne Pages Functions 约定的全捕获路由），无需额外构建。
+2. 配置：
+   - 框架预设：**Other**
+   - 根目录：`/`
+   - **输出目录：`public`**
+   - **构建命令：留空**
+   - **安装命令：留空**
+3. 入口为 `functions/[[default]].js`（EdgeOne Pages Functions 约定的全捕获路由），自动识别，无需额外构建。
 
 ## 本地开发 / 构建
 
