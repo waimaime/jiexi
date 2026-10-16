@@ -249,7 +249,7 @@ const PARSE_TIMEOUT_MS = 20000;
 const PROXY_TIMEOUT_MS = 60000;
 
 const PROXY_TOKEN = '';
-const PARSER_VERSION = '2026.10.16.14';
+const PARSER_VERSION = '2026.10.16.15';
 
 // 本地可解析的平台（其它一律走兜底）
 const DOUYIN_RE = /douyin\.com|iesdouyin\.com|snssdk\.com|wtturl\.cn/i;
@@ -406,6 +406,54 @@ async function adaptXhs(res) {
 
 /* ---------------- 解析 ---------------- */
 
+/**
+ * 统一结果结构（对齐竞品「皮皮去水印」的 vs / is / ms / ts 四类模型）：
+ *   vs —— 视频清晰度列表 [{ u, q, w, h }]
+ *   is —— 图集 [{ i }]
+ *   ms —— 音频 [{ m, q }]
+ *   ts —— 结构化文案 [{ n: 标题/内容/封面, b: 文本, u: 链接, t: 是否图片 }]
+ * 原有字段（videoUrl / images / audioUrl / title / cover）全部保留，
+ * 老版本小程序不受影响。
+ */
+function normalizeResult(data) {
+  if (!data || typeof data !== 'object') return data;
+  const out = Object.assign({}, data);
+
+  const vs = Array.isArray(data.vs) && data.vs.length
+    ? data.vs
+    : data.videoUrl ? [{ u: data.videoUrl, q: '默认', w: 0, h: 0 }] : [];
+  out.vs = vs
+    .map((v) => ({
+      u: (v && (v.u || v.v || v.url)) || '',
+      q: (v && (v.q || v.quality)) || '默认',
+      w: (v && v.w) || 0,
+      h: (v && v.h) || 0,
+    }))
+    .filter((v) => v.u);
+
+  const images = Array.isArray(data.images) ? data.images : [];
+  out.is = images
+    .map((u) => (typeof u === 'string' ? { i: u } : { i: (u && (u.i || u.url || u.u)) || '' }))
+    .filter((x) => x.i);
+
+  const audioUrl =
+    data.audioUrl ||
+    (Array.isArray(data.ms) && data.ms[0] && (data.ms[0].m || data.ms[0].url || data.ms[0].u)) ||
+    '';
+  out.audioUrl = audioUrl;
+  out.ms = audioUrl ? [{ m: audioUrl, q: '音频' }] : [];
+
+  const title = data.title || '';
+  const desc = data.desc || data.caption || '';
+  const ts = [];
+  if (title) ts.push({ n: '标题', b: title, u: '', t: 0 });
+  if (desc && desc !== title) ts.push({ n: '内容', b: desc, u: '', t: 0 });
+  if (data.cover) ts.push({ n: '封面', b: '', u: data.cover, t: 1 });
+  out.ts = ts;
+
+  return out;
+}
+
 /** 本地解析（抖音 / B站 / 小红书）；返回统一契约或 null */
 async function parseLocal(text) {
   if (DOUYIN_RE.test(text)) {
@@ -548,13 +596,13 @@ async function handleParse(req, url) {
 
   try {
     const local = await parseLocal(shareUrl);
-    if (local) return json({ ok: true, data: local, _source: 'local' });
+    if (local) return json({ ok: true, data: normalizeResult(local), _source: 'local' });
   } catch (e) {
     // 本地失败，静默降级
   }
 
   const remote = fallbackPromise ? await fallbackPromise : await parseFallback(shareUrl);
-  if (remote) return json({ ok: true, data: remote, _source: 'fallback', _via: remote.via || '' });
+  if (remote) return json({ ok: true, data: normalizeResult(remote), _source: 'fallback', _via: remote.via || '' });
 
   throw new HttpError('解析失败，请稍后重试或反馈该链接', 502);
 }
