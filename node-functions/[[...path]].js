@@ -245,7 +245,7 @@ const PARSE_TIMEOUT_MS = 20000;
 const PROXY_TIMEOUT_MS = 60000;
 
 const PROXY_TOKEN = '';
-const PARSER_VERSION = '2026.10.16.3';
+const PARSER_VERSION = '2026.10.16.4';
 
 // 本地可解析的平台（其它一律走兜底）
 const DOUYIN_RE = /douyin\.com|iesdouyin\.com|snssdk\.com|wtturl\.cn/i;
@@ -1127,6 +1127,17 @@ function buildBilibiliHeaders(extra = {}) {
   // 正常浏览的游客而非爬虫，显著降低海外出口被风控的概率。
   if (anonCookieCache) {
     headers.Cookie = anonCookieCache;
+  }
+
+  // 登录态（可选）：配置 BILI_SESSDATA 后，B站会按账号权限下发更高清晰度
+  // （未登录最高 720P / 登录 1080P / 大会员 4K）。注意：它只影响清晰度，
+  // 不影响水印——UP主开启的防盗录水印是服务端转码烧录的，任何清晰度都在。
+  const sessdata = (process.env && process.env.BILI_SESSDATA || "").trim();
+  if (sessdata) {
+    const loginCookie = /SESSDATA=/i.test(sessdata) ? sessdata : `SESSDATA=${sessdata}`;
+    headers.Cookie = headers.Cookie
+      ? `${headers.Cookie}; ${loginCookie}`
+      : loginCookie;
   }
   return headers;
 }
@@ -2444,7 +2455,8 @@ const __handler = {
 export const onRequest = async (context) => {
   const { request, env } = context;
   try {
-    return await __handler.fetch(request);
+    // 把 EdgeOne 环境变量透传进去（BILI_SESSDATA / XHS_COOKIE 等）
+    return await __handler.fetch(request, env || {});
   } catch (err) {
     return new Response(JSON.stringify({ ok: false, code: 500, message: String((err && err.message) || err) }), {
       status: 200,
