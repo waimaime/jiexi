@@ -20,6 +20,14 @@ curl "https://<你的域名>/api/parse?url=<分享链接或口令>"
 
 返回字段：`code`、`data.title`、`data.url`、`data.cover`、`data.vs[]`（多清晰度）、`data.audioUrl`、`data.e`（过期时间戳 ms）、`data._source`（local / fallback）。
 
+## 环境变量（EdgeOne 项目 → 环境变量，改完需重新部署）
+
+| 变量 | 说明 |
+|---|---|
+| `REVIEW_MODE` | 审核模式开关。`true` 时 `/api/config` 返回 `reviewMode: true`，小程序启动直接进「涂抹去水印」页，不显示解析首页；审核通过后改 `false`，**无需发新版** |
+| `XHS_COOKIE` | 小红书登录 Cookie（`web_session=xxx`），解析需登录的笔记时使用 |
+| `BILI_SESSDATA` | B站登录态，配置后可解锁 1080P / 4K（未登录最高 720P）。注意：只提升清晰度，去不掉 UP 主烧录的水印 |
+
 ## 目录结构
 
 ```
