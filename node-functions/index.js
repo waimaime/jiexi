@@ -236,8 +236,12 @@ const refXhs = require('../server/parsers/ref/xhs');
 
 /* ---------------- 配置 ---------------- */
 
-// 兜底解析源（你自部署的解析服务，GET ?url= 方式）
-const FALLBACK_BASE = 'https://qsy.kkkkm.com';
+// 兜底解析源（自部署的解析服务，GET ?url= 方式）。
+// 主服务（jiexi.kkkkm.com）解析不出来时，并发请求下面所有源，取最先成功的那个。
+const FALLBACK_BASES = [
+  'https://qsy.kkkkm.com',
+  'https://qsy.kkkkm.qzz.io',
+];
 const FALLBACK_PATH = '/api/parse';
 
 // 超时
@@ -245,7 +249,7 @@ const PARSE_TIMEOUT_MS = 20000;
 const PROXY_TIMEOUT_MS = 60000;
 
 const PROXY_TOKEN = '';
-const PARSER_VERSION = '2026.10.16.7';
+const PARSER_VERSION = '2026.10.16.8';
 
 // 本地可解析的平台（其它一律走兜底）
 const DOUYIN_RE = /douyin\.com|iesdouyin\.com|snssdk\.com|wtturl\.cn/i;
@@ -423,13 +427,26 @@ async function parseLocal(text) {
   return null;
 }
 
-/** 兜底源解析（GET ?url=） */
+/**
+ * 兜底源解析：并发请求 FALLBACK_BASES 里的所有源，取最先成功的那个。
+ * 某个源超时/报错/返回空一律跳过，全部失败才返回 null。
+ */
 async function parseFallback(text) {
+  const tasks = FALLBACK_BASES.map((base) => fetchFallback(base, text).catch(() => null));
+  for (let i = 0; i < tasks.length; i++) {
+    const result = await tasks[i];
+    if (result) return result;
+  }
+  return null;
+}
+
+/** 单个兜底源解析（GET ?url=） */
+async function fetchFallback(base, text) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), PARSE_TIMEOUT_MS);
   try {
     const upstream = await fetch(
-      FALLBACK_BASE + FALLBACK_PATH + '?url=' + encodeURIComponent(text),
+      base + FALLBACK_PATH + '?url=' + encodeURIComponent(text),
       {
         method: 'GET',
         signal: controller.signal,
@@ -479,6 +496,8 @@ async function parseFallback(text) {
     return {
       platform: data.platform || 'remote',
       platformName: data.platformName || '去水印',
+      // 记录实际由哪个兜底源解析成功，便于排查
+      via: base,
       title: data.title || data.caption || data.desc || '',
       cover,
       videoUrl,
@@ -531,7 +550,7 @@ async function handleParse(req, url) {
   }
 
   const remote = fallbackPromise ? await fallbackPromise : await parseFallback(shareUrl);
-  if (remote) return json({ ok: true, data: remote, _source: 'fallback' });
+  if (remote) return json({ ok: true, data: remote, _source: 'fallback', _via: remote.via || '' });
 
   throw new HttpError('解析失败，请稍后重试或反馈该链接', 502);
 }
