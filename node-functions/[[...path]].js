@@ -245,7 +245,7 @@ const PARSE_TIMEOUT_MS = 20000;
 const PROXY_TIMEOUT_MS = 60000;
 
 const PROXY_TOKEN = '';
-const PARSER_VERSION = '2026.10.16.6';
+const PARSER_VERSION = '2026.10.16.7';
 
 // 本地可解析的平台（其它一律走兜底）
 const DOUYIN_RE = /douyin\.com|iesdouyin\.com|snssdk\.com|wtturl\.cn/i;
@@ -647,6 +647,16 @@ async function handle(req, context) {
             { platform: 'kuaishou', platformName: '快手', enabled: true, notice: '' },
             { platform: 'xiaohongshu', platformName: '小红书', enabled: true, notice: '' },
           ],
+        },
+      });
+    }
+    if (pathname === '/api/debug/review') {
+      return json({
+        ok: true,
+        data: {
+          reviewMode: isReviewMode(),
+          raw: String((process && process.env && process.env.REVIEW_MODE) || 'unset'),
+          processEnvKeys: Object.keys((process && process.env) || {}).filter((k) => !/(SESSDATA|COOKIE|KEY|TOKEN|SECRET)/i.test(k)),
         },
       });
     }
