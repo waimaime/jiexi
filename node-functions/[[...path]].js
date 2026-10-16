@@ -230,6 +230,7 @@ __define("edgeone/router.js", function (module, exports, require) {
 
 const config = require('../server/config');
 const { HttpError, extractUrl } = require('../server/lib/http');
+const { isProxyHostAllowed, refererFor, isPrivateHost } = require('../server/lib/proxy-guard');
 const ownDouyin = require('../server/parsers/douyin');
 const refBilibili = require('../server/parsers/ref/bilibili');
 const refXhs = require('../server/parsers/ref/xhs');
@@ -248,7 +249,7 @@ const PARSE_TIMEOUT_MS = 20000;
 const PROXY_TIMEOUT_MS = 60000;
 
 const PROXY_TOKEN = '';
-const PARSER_VERSION = '2026.10.16.10';
+const PARSER_VERSION = '2026.10.16.11';
 
 // 本地可解析的平台（其它一律走兜底）
 const DOUYIN_RE = /douyin\.com|iesdouyin\.com|snssdk\.com|wtturl\.cn/i;
@@ -579,14 +580,17 @@ async function handleProxy(req, url) {
   }
 
   const host = mediaUrl.hostname.toLowerCase();
-  const allowed = (config.proxyAllowedHosts || []).some((re) => re.test(host));
-  if (!allowed) throw new HttpError('该域名不在代理白名单内', 403);
+  // 内网/本机一律拦（SSRF 防护）；其余按白名单放行，
+  // 环境变量 PROXY_ALLOW_ALL=true 时可整体关闭域名校验。
+  if (!isProxyHostAllowed(host)) {
+    throw new HttpError(`该域名不在代理白名单内：${host}`, 403);
+  }
 
   const headers = {
     'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
     Accept: '*/*',
   };
-  const rule = (config.refererRules || []).find((r) => r.test.test(host));
+  const rule = refererFor(host);
   if (rule) {
     headers.Referer = rule.referer;
     headers.Origin = rule.origin;
@@ -682,6 +686,31 @@ async function handle(req, context) {
         },
       });
     }
+    // 排查代理 403 用：/api/debug/proxy?url=<媒体地址>
+    // 返回该地址是否被白名单放行，以及命中的防盗链规则。
+    if (pathname === '/api/debug/proxy') {
+      let host = '';
+      let parsed = false;
+      try {
+        host = new URL(String(url.searchParams.get('url') || '')).hostname.toLowerCase();
+        parsed = true;
+      } catch (e) {
+        /* url 参数非法 */
+      }
+      const rule = host ? refererFor(host) : null;
+      return json({
+        ok: true,
+        data: {
+          parsed,
+          host,
+          allowed: host ? isProxyHostAllowed(host) : false,
+          privateBlocked: host ? isPrivateHost(host) : false,
+          allowAll: !!config.proxyAllowAll,
+          extraHosts: config.proxyExtraHosts || [],
+          referer: rule ? rule.referer : '',
+        },
+      });
+    }
     const isParse = pathname === '/api/parse' || pathname === '/api/dewatermark/parseurl' || pathname === '/parse';
     if (isParse) {
       return await handleParse(req, url);
@@ -758,34 +787,85 @@ module.exports = {
   // 访问上游的超时时间（毫秒）
   upstreamTimeout: 12000,
 
+  // ===== 媒体代理（/api/proxy）访问控制 =====
+  //
+  // proxyAllowAll=true  → 关闭域名白名单（任何 http/https 都可代理）
+  //                       注意：这等于开放代理，有被盗刷流量的风险，
+  //                       仅建议在调试/自用阶段临时开启。
+  // proxyAllowAll=false → 只放行下面的白名单（推荐）
+  proxyAllowAll: /^(true|1|yes|on)$/i.test(String(env.PROXY_ALLOW_ALL || '').trim()),
+
+  // 额外放行的域名后缀（逗号分隔），用于临时补漏而不用改代码重新构建。
+  // 例：export PROXY_EXTRA_HOSTS="foo-cdn.com,bar.video"
+  proxyExtraHosts: String(env.PROXY_EXTRA_HOSTS || '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase().replace(/^\./, ''))
+    .filter(Boolean),
+
   // 代理接口允许回源的域名（防止服务被当成开放代理）
+  // 覆盖主流短视频/社交平台的「视频 + 图片(封面/图集) + 音频」CDN
   proxyAllowedHosts: [
-    /\.douyin\.com$/i,
-    /\.douyinpic\.com$/i,
-    /\.douyinvod\.com$/i,
-    /\.douyincdn\.com$/i,
-    /\.snssdk\.com$/i,
-    /\.ixigua\.com$/i,
-    /\.ixiguavideo\.com$/i,
-    /\.kuaishou\.com$/i,
-    /\.kscdn\.com$/i,
-    /\.kwimgs\.com$/i,
-    /\.xhscdn\.com$/i,
-    /\.xiaohongshu\.com$/i,
-    /\.sns-video-[a-z0-9]+\.xhscdn\.com$/i,
-    // B 站视频/音频 CDN
-    /\.bilivideo\.com$/i,
-    /\.biliapi\.net$/i,
-    /\.bilibili\.com$/i,
-    /\.hdslb\.com$/i,
+    // ---- 抖音 / 火山 / 西瓜 / 今日头条（字节系）----
+    /(^|\.)(douyin|douyinpic|douyinvod|douyincdn|douyinstatic|douyinmusic|iesdouyin|amemv|snssdk|ixigua|ixiguavideo|hotsoon|huoshan|toutiaovod|toutiaoimg|toutiaostatic|byteimg|bytecdn|byteoversea|zjcdn|ecombdimg|pstatp|volccdn|volcvod)\.(com|cn|net)$/i,
+    // ---- 快手（视频走 kwimgs，图片走 yximgs / gifshow / chenzhongtech）----
+    /(^|\.)(kuaishou|kscdn|kwimgs|yximgs|gifshow|chenzhongtech|ksyungslb|ksplay|kwai|kwaicdn|ks-cdn)\.(com|cn|net)$/i,
+    // ---- 小红书 ----
+    /(^|\.)(xhscdn|xiaohongshu|xhsusercontent|xhslink)\.(com|cn|net)$/i,
+    // ---- B站 ----
+    /(^|\.)(bilibili|bilivideo|acgvideo|hdslb|biliapi|bfsimg|bfs-static|b23)\.(com|cn|net|tv)$/i,
+    /(^|\.)akamaized\.net$/i,
+    // ---- 微博 / 秒拍 ----
+    /(^|\.)(weibo|weibocdn|miaopai)\.(com|cn)$/i,
+    /(^|\.)sinaimg\.cn$/i,
+    /(^|\.)sina\.com\.cn$/i,
+    // ---- 微视 / 腾讯系 ----
+    /(^|\.)(qpic|gtimg|qcloudimg)\.(cn|com)$/i,
+    /(^|\.)(video|weishi)\.qq\.com$/i,
+    /(^|\.)tc\.qq\.com$/i,
+    /(^|\.)(myqcloud|tencent-cloud)\.(com|net)$/i,
+    // ---- 皮皮虾 / 皮皮搞笑 ----
+    /(^|\.)(ippzone|hjypbd|pipigx|baishancdn)\.(com|cn)$/i,
+    // ---- 最右 ----
+    /(^|\.)izuiyou\.(com|net)$/i,
+    // ---- 美拍 ----
+    /(^|\.)(meipai|meitudata)\.com$/i,
+    // ---- 全民K歌 / QQ音乐 ----
+    /(^|\.)(kg\.qq|kgcdn)\.com$/i,
+    // ---- AcFun ----
+    /(^|\.)acfun(video)?\.cn$/i,
+    // ---- 好看视频 / 百度 ----
+    /(^|\.)haokan\.baidu\.com$/i,
+    /(^|\.)bdstatic\.com$/i,
+    // ---- 梨视频 ----
+    /(^|\.)pearvideo\.com$/i,
+    // ---- 新片场 ----
+    /(^|\.)(xinpianchang|vmsva)\.com$/i,
+    // ---- TikTok ----
+    /(^|\.)(tiktokcdn|tiktokv|muscdn|tiktok)\.com$/i,
+    // ---- Twitter / X ----
+    /(^|\.)(twimg\.com|pscp\.tv)$/i,
+    // ---- 通用对象存储 / 商业 CDN（兜底，避免新 CDN 直接 403）----
+    /(^|\.)(qiniu|qiniudn|qbox|clouddn|aliyuncs|alicdn|aliyuncdn|ksyuncs|wangsu|chinacache|bdydns|huaweicloud|hwcdn|cdn77)\.(com|cn|net|me|org)$/i,
+    /(^|\.)cloudfront\.net$/i,
   ],
 
   // 代理回源时按域名补 Referer / User-Agent，绕开防盗链
   refererRules: [
-    { test: /douyin|ixigua|snssdk/i, referer: 'https://www.douyin.com/', origin: 'https://www.douyin.com' },
-    { test: /kuaishou|kscdn|kwimgs/i, referer: 'https://www.kuaishou.com/', origin: 'https://www.kuaishou.com' },
-    { test: /xhscdn|xiaohongshu/i, referer: 'https://www.xiaohongshu.com/', origin: 'https://www.xiaohongshu.com' },
-    { test: /bilibili|bilivideo|hdslb|biliapi/i, referer: 'https://www.bilibili.com/', origin: 'https://www.bilibili.com' },
+    { test: /douyin|ixigua|snssdk|amemv|hotsoon|huoshan|toutiao|byteimg|bytecdn|zjcdn|ecombdimg|pstatp|volc/i, referer: 'https://www.douyin.com/', origin: 'https://www.douyin.com' },
+    { test: /kuaishou|kscdn|kwimgs|yximgs|gifshow|chenzhongtech|ksyungslb|ksplay|kwai|ksyuncs/i, referer: 'https://www.kuaishou.com/', origin: 'https://www.kuaishou.com' },
+    { test: /xhscdn|xiaohongshu|xhsusercontent/i, referer: 'https://www.xiaohongshu.com/', origin: 'https://www.xiaohongshu.com' },
+    { test: /bilibili|bilivideo|hdslb|biliapi|acgvideo|bfsimg|akamaized/i, referer: 'https://www.bilibili.com/', origin: 'https://www.bilibili.com' },
+    { test: /weibo|weibocdn|sinaimg|miaopai|sina\.com\.cn/i, referer: 'https://weibo.com/', origin: 'https://weibo.com' },
+    { test: /qq\.com|qpic|gtimg|myqcloud|tencent-cloud|qcloudimg/i, referer: 'https://h5.weishi.qq.com/', origin: 'https://h5.weishi.qq.com' },
+    { test: /ippzone|hjypbd|pipigx|baishancdn/i, referer: 'https://www.ippzone.com/', origin: 'https://www.ippzone.com' },
+    { test: /izuiyou/i, referer: 'https://www.izuiyou.com/', origin: 'https://www.izuiyou.com' },
+    { test: /meipai|meitudata/i, referer: 'https://www.meipai.com/', origin: 'https://www.meipai.com' },
+    { test: /acfun/i, referer: 'https://www.acfun.cn/', origin: 'https://www.acfun.cn' },
+    { test: /haokan|baidu|bdstatic/i, referer: 'https://haokan.baidu.com/', origin: 'https://haokan.baidu.com' },
+    { test: /pearvideo/i, referer: 'https://www.pearvideo.com/', origin: 'https://www.pearvideo.com' },
+    { test: /xinpianchang|vmsva/i, referer: 'https://www.xinpianchang.com/', origin: 'https://www.xinpianchang.com' },
+    { test: /tiktok|muscdn|byteoversea/i, referer: 'https://www.tiktok.com/', origin: 'https://www.tiktok.com' },
+    { test: /twimg|pscp\.tv/i, referer: 'https://twitter.com/', origin: 'https://twitter.com' },
   ],
 };
 
@@ -922,6 +1002,74 @@ module.exports = {
   jsonFromHtml,
   collectCookies,
 };
+
+});
+__define("server/lib/proxy-guard.js", function (module, exports, require) {
+'use strict';
+
+/**
+ * 媒体代理（/api/proxy）的访问控制。
+ *
+ * 设计原则：
+ *   1. 默认只放行短视频/社交平台的媒体 CDN（白名单），避免接口变成开放代理被刷流量；
+ *   2. 环境变量 PROXY_ALLOW_ALL=true 可一键关闭域名校验；
+ *   3. 环境变量 PROXY_EXTRA_HOSTS=a.com,b.com 可临时补漏，无需改代码；
+ *   4. 无论开关如何，内网/本机地址一律拦截（SSRF 防护，这条是底线）。
+ */
+
+const config = require('../config');
+
+const IPV4_RE = /^\d{1,3}(?:\.\d{1,3}){3}$/;
+
+function isPrivateIpv4(host) {
+  const parts = host.split('.').map(Number);
+  if (parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return true; // 非法 IP 一律拦
+  const [a, b] = parts;
+  if (a === 0 || a === 10 || a === 127) return true;
+  if (a === 169 && b === 254) return true; // link-local
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT 100.64/10
+  if (a >= 224) return true; // 组播 / 保留 / 实验地址
+  return false;
+}
+
+function isPrivateHost(rawHost) {
+  const h = String(rawHost || '').toLowerCase().replace(/\.$/, '');
+  if (!h) return true;
+  if (h.includes(':')) return true; // IPv6（含 ::1）一律拦
+  if (h === 'localhost' || h.endsWith('.localhost')) return true;
+  if (h.endsWith('.local') || h.endsWith('.internal')) return true;
+  if (h.endsWith('.intranet') || h.endsWith('.lan')) return true;
+  if (h.endsWith('.home.arpa')) return true;
+  if (IPV4_RE.test(h)) return isPrivateIpv4(h);
+  return false;
+}
+
+function extraHostAllowed(host) {
+  const list = config.proxyExtraHosts || [];
+  if (!list.length) return false;
+  return list.some((s) => host === s || host.endsWith('.' + s));
+}
+
+/** 判断某个回源域名是否允许被代理 */
+function isProxyHostAllowed(rawHost) {
+  const host = String(rawHost || '').toLowerCase();
+  if (!host) return false;
+  if (isPrivateHost(host)) return false; // SSRF：任何开关下都生效
+  if (config.proxyAllowAll) return true;
+  if (extraHostAllowed(host)) return true;
+  return (config.proxyAllowedHosts || []).some((re) => re.test(host));
+}
+
+/** 命中防盗链规则时返回 { referer, origin }，否则 null */
+function refererFor(rawHost) {
+  const host = String(rawHost || '').toLowerCase();
+  const rule = (config.refererRules || []).find((r) => r.test.test(host));
+  return rule || null;
+}
+
+module.exports = { isProxyHostAllowed, refererFor, isPrivateHost };
 
 });
 __define("server/parsers/douyin.js", function (module, exports, require) {
@@ -2488,6 +2636,7 @@ if (typeof process === 'undefined') {
 }
 
 const __handler = {
+
   async fetch(request, env, ctx) {
     if (env && typeof env === 'object') {
       globalThis.process.env = Object.assign({}, globalThis.process.env, env);
@@ -2499,6 +2648,7 @@ const __handler = {
 export const onRequest = async (context) => {
   const { request, env } = context;
   try {
+    // 把 EdgeOne 环境变量透传进去（BILI_SESSDATA / XHS_COOKIE / REVIEW_MODE / PROXY_ALLOW_ALL 等）
     return await __handler.fetch(request, env || {});
   } catch (err) {
     return new Response(JSON.stringify({ ok: false, code: 500, message: String((err && err.message) || err) }), {
