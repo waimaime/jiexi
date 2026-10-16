@@ -27,6 +27,18 @@ curl "https://<你的域名>/api/parse?url=<分享链接或口令>"
 | `REVIEW_MODE` | 审核模式开关。`true` 时 `/api/config` 返回 `reviewMode: true`，小程序启动直接进「涂抹去水印」页，不显示解析首页；审核通过后改 `false`，**无需发新版** |
 | `XHS_COOKIE` | 小红书登录 Cookie（`web_session=xxx`），解析需登录的笔记时使用 |
 | `BILI_SESSDATA` | B站登录态，配置后可解锁 1080P / 4K（未登录最高 720P）。注意：只提升清晰度，去不掉 UP 主烧录的水印 |
+| `PROXY_ALLOW_ALL` | `true` 时关闭 `/api/proxy` 域名白名单（任何 http/https 都可代理）。默认 `false`（仅放行白名单 CDN），设成 `true` 等于开放代理，有被盗刷流量的风险，**仅建议调试/自用时临时开启** |
+| `PROXY_EXTRA_HOSTS` | 逗号分隔的额外放行域名后缀，临时补漏用，例：`foo-cdn.com,bar.video`，无需改代码 |
+
+### 代理白名单覆盖范围
+
+默认覆盖以下平台的「视频 + 图片(封面/图集) + 音频」CDN（`server/config.js` 里的 `proxyAllowedHosts`）：
+
+字节系（抖音/西瓜/火山/今日头条）、快手（kwimgs / yximgs / gifshow / chenzhongtech）、小红书、B 站（bilibili / hdslb / akamaized / bfsimg）、微博 / 秒拍、腾讯系（微视/视频号）、皮皮虾 / 皮皮搞笑、最右、美拍、全民K歌、AcFun、好看视频、梨视频、新片场、TikTok、Twitter/X，以及通用对象存储（qiniu / aliyun / cloudfront / huaweicloud / cloudfront 等）。
+
+**SSRF 防护**（`server/lib/proxy-guard.js`）：无论开关如何，`127.0.0.1` / `localhost` / `10.*` / `192.168.*` / `172.16-31.*` / `169.254.*` / IPv6 等内网地址一律拦截。
+
+排查代理 403 用 `GET /api/debug/proxy?url=<媒体地址>`，会返回 `{ allowed, privateBlocked, allowAll, extraHosts, referer }`。
 
 ## 兜底源（多源并发）
 
@@ -68,4 +80,4 @@ node-functions/[[...path]].js     # 全捕获路由 「/*」（解析 / 代理�
 
 - B站解析需要 WBI 签名（MD5），已在构建时注入纯 JS 实现。
 - `X-Identity` 签名头默认不强制（`SIGN_REQUIRED=true` 可开启校验）。
-- 代理白名单见 `src/router.js` 中的 `handleProxy`（含 B站 CDN 等）。
+- 代理访问控制（白名单 / SSRF / 开关）见 `server/config.js` 与 `server/lib/proxy-guard.js`。
