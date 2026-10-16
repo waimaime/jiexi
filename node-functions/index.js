@@ -245,7 +245,7 @@ const PARSE_TIMEOUT_MS = 20000;
 const PROXY_TIMEOUT_MS = 60000;
 
 const PROXY_TOKEN = '';
-const PARSER_VERSION = '2026.10.16.5';
+const PARSER_VERSION = '2026.10.16.6';
 
 // 本地可解析的平台（其它一律走兜底）
 const DOUYIN_RE = /douyin\.com|iesdouyin\.com|snssdk\.com|wtturl\.cn/i;
@@ -613,6 +613,12 @@ function normalizePath(pathname) {
   return p;
 }
 
+/** 审核模式开关：由 EdgeOne 环境变量 REVIEW_MODE 控制（true/1 开启） */
+function isReviewMode() {
+  const raw = String((typeof process !== 'undefined' && process.env && process.env.REVIEW_MODE) || '');
+  return /^(true|1|yes|on)$/i.test(raw.trim());
+}
+
 async function handle(req, context) {
   const url = new URL(req.url);
   const pathname = normalizePath(url.pathname);
@@ -632,6 +638,9 @@ async function handle(req, context) {
         data: {
           parserVersion: PARSER_VERSION,
           announcement: '',
+          // 审核模式：EdgeOne 环境变量 REVIEW_MODE=true 时，小程序启动直接进
+          // 涂抹去水印页（不显示解析首页）；审核通过后改成 false，无需发新版。
+          reviewMode: isReviewMode(),
           platforms: [
             { platform: 'douyin', platformName: '抖音', enabled: true, notice: '' },
             { platform: 'bilibili', platformName: '哔哩哔哩', enabled: true, notice: '' },
