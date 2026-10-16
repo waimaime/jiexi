@@ -222,7 +222,7 @@ __define("edgeone/router.js", function (module, exports, require) {
  * 解析策略（实测数据驱动，不猜）：
  *   - 抖音   → 本地解析器（实测可解，免费且快）
  *   - B站    → 本地解析器（实测可解，依赖 WBI 签名需真 MD5）
- *   - 小红书 → 本地已失效（上游改版强制 token+签名），走兜底源
+ *   - 小红书 → 本地解析器（移动 UA 取 __INITIAL_STATE__，实测可取原片直链）
  *   - 快手   → 本地已失效（上游改版纯 SSR），走兜底源
  *   - 其它   → 走兜底源
  * 本地解析失败时一律自动降级到兜底源，保证可用性。
@@ -232,6 +232,7 @@ const config = require('../server/config');
 const { HttpError, extractUrl } = require('../server/lib/http');
 const ownDouyin = require('../server/parsers/douyin');
 const refBilibili = require('../server/parsers/ref/bilibili');
+const refXhs = require('../server/parsers/ref/xhs');
 
 /* ---------------- 配置 ---------------- */
 
@@ -244,11 +245,12 @@ const PARSE_TIMEOUT_MS = 20000;
 const PROXY_TIMEOUT_MS = 60000;
 
 const PROXY_TOKEN = '';
-const PARSER_VERSION = '2026.10.16.2';
+const PARSER_VERSION = '2026.10.16.3';
 
 // 本地可解析的平台（其它一律走兜底）
 const DOUYIN_RE = /douyin\.com|iesdouyin\.com|snssdk\.com|wtturl\.cn/i;
 const BILIBILI_RE = /bilibili\.com|b23\.tv/i;
+const XHS_RE = /xiaohongshu\.com|xhslink\.com|xhslink\.cn/i;
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -325,9 +327,78 @@ function adaptBilibili(res) {
   };
 }
 
+/** ref 解析器把图片包成了站内代理路径 /api/image?url=<encoded>，这里还原成真实地址 */
+function decodeProxy(u) {
+  const s = String(u || '');
+  if (s.indexOf('?url=') >= 0) {
+    try {
+      return decodeURIComponent(s.split('?url=').slice(-1)[0]);
+    } catch (e) {
+      return s;
+    }
+  }
+  return s;
+}
+
+/**
+ * 图片尽量取原图：小红书 CDN 链接常带 `!h5_1080jpg` 之类的裁剪后缀，
+ * 去掉后缀可能是更高清的原图，也可能直接 404，故用 HEAD 探测后决定。
+ */
+async function upgradeImageUrl(raw) {
+  const url = decodeProxy(raw);
+  const bang = url.indexOf('!');
+  if (bang < 0 || !/^https?:/i.test(url)) return url;
+  const candidate = url.slice(0, bang);
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4000);
+    const head = await fetch(candidate, { method: 'HEAD', signal: controller.signal });
+    clearTimeout(timer);
+    if (head.ok) return candidate;
+  } catch (e) {
+    /* 探测失败，保留原链接 */
+  }
+  return url;
+}
+
+/**
+ * 把 ref 的小红书解析器返回适配成统一契约。
+ * ref 返回：{ code:200, data:[{ title, desc, url|images[], cover, author }] }
+ */
+async function adaptXhs(res) {
+  if (!res || (res.code !== undefined && res.code !== 200 && res.code !== 1)) return null;
+  const list = Array.isArray(res.data) ? res.data : [];
+  const d = list[0] || res.data;
+  if (!d || typeof d !== 'object') return null;
+
+  const rawImages = Array.isArray(d.images) ? d.images : [];
+  // 最多升级前 3 张，避免图集很多时拖慢响应
+  const images = await Promise.all(
+    rawImages.map((u, i) => (i < 3 ? upgradeImageUrl(u) : Promise.resolve(decodeProxy(u))))
+  );
+  let cover = d.cover ? await upgradeImageUrl(d.cover) : '';
+  if (!cover && images.length) cover = images[0];
+
+  const videoUrl = decodeProxy(d.url || d.videoUrl || '');
+  if (!videoUrl && !images.length) return null;
+
+  return {
+    platform: 'xiaohongshu',
+    platformName: '小红书',
+    title: d.title || d.desc || '',
+    cover,
+    videoUrl,
+    images,
+    vs: videoUrl ? [{ u: videoUrl, q: '默认', w: 0, h: 0 }] : [],
+    audioUrl: '',
+    e: 0,
+    type: images.length && !videoUrl ? 'image' : 'video',
+  };
+}
+
 /* ---------------- 解析 ---------------- */
 
-/** 本地解析（仅抖音 / B站）；返回统一契约或 null */
+/** 本地解析（抖音 / B站 / 小红书）；返回统一契约或 null */
 async function parseLocal(text) {
   if (DOUYIN_RE.test(text)) {
     const r = await ownDouyin.parse(text);
@@ -337,6 +408,17 @@ async function parseLocal(text) {
   if (BILIBILI_RE.test(text)) {
     const raw = await refBilibili(text);
     return adaptBilibili(raw);
+  }
+  // 小红书：本地解析（移动 UA 取 __INITIAL_STATE__，实测可取到原片直链）
+  if (XHS_RE.test(text)) {
+    try {
+      const raw = await refXhs(text);
+      const adapted = await adaptXhs(raw);
+      if (adapted) return adapted;
+    } catch (e) {
+      // 本地失败（风控/需登录）→ 由调用方降级到兜底源
+    }
+    return null;
   }
   return null;
 }
@@ -1908,6 +1990,438 @@ function biliFetch(url, init = {}) {
 
 
 module.exports = Object.assign(module.exports || {}, { biliFetch, BILIBILI_USER_AGENT });
+
+});
+__define("server/parsers/ref/xhs.js", function (module, exports, require) {
+/**
+ * 小红书解析（纯函数模块，无 HTTP 边界）
+ * 由 /api/xhs 路由与统一入口 /api/parse 直接函数调用；
+ * 逻辑原样下沉自路由文件，行为未改动。
+ */
+
+const { logger, DELETED_CONTENT_MSG } = require("../../lib-ref/lib/api-utils");
+
+
+/**
+ * 小红书 H5 UA：**必须用移动端**。
+ *
+ * 2026-09-23 实测：同一篇笔记，桌面 Chrome/Edge UA 请求笔记页会被强制 302 到
+ * /login?redirectPath=...（服务端出口 IP 无登录态一律如此），换了 redirectPath
+ * 重试仍是登录页 → 线上 4 次全部报 403「该笔记需要登录小红书后才能查看」；
+ * 同一 IP 换成 iPhone Safari UA 立刻拿到 200 + 完整 __INITIAL_STATE__
+ * （noteData.data.noteData，含 video.media.stream 的 h264 backupUrls/masterUrl）。
+ * xhslink 短链同理：移动 UA 下 302 直达笔记页而不是登录页。
+ *
+ * 移动端 UA 是「无需 Cookie 即可解析」的关键，不要为了「像浏览器」改回桌面 UA。
+ */
+const XHS_USER_AGENT =
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
+
+/** 网页端登录 Cookie（可选）：形如 `web_session=xxx; a1=xxx`，配了才带 */
+function xhsCookie() {
+  return (process.env.XHS_COOKIE || "").trim();
+}
+
+/** 统一构造请求头：移动 UA + 可选 Cookie（短链与重定向两处共用） */
+function xhsHeaders(extra = {}) {
+  const headers = {
+    "User-Agent": XHS_USER_AGENT,
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    ...extra,
+  };
+  const cookie = xhsCookie();
+  if (cookie) headers.Cookie = cookie;
+  return headers;
+}
+
+function output(code, msg, data = []) {
+  return {
+    code,
+    msg,
+    data,
+  };
+}
+
+function normalizeXhsUrl(url) {
+  try {
+    const u = new URL(url.trim());
+    const host = u.hostname.toLowerCase();
+    // xhslink.com / xhslink.cn 短链统一走 https
+    if (["xhslink.com", "xhslink.cn"].includes(host) && u.protocol === "http:") {
+      u.protocol = "https:";
+      return u.toString();
+    }
+  } catch {
+    /* ignore */
+  }
+  return url.trim();
+}
+
+/**
+ * 短链与笔记页：手动跟随重定向，兼容 xhslink.com 的 o/ 短链。
+ * 小红书对部分分享链接（或无 Cookie 的服务器请求）会强制 302 到
+ * /login?redirectPath=<真实笔记页>；此时提取 redirectPath 直接请求
+ * 真实笔记页重试，避免把登录页当笔记页解析。
+ */
+async function fetchXhsNoteHtml(url) {
+  const target = normalizeXhsUrl(url);
+  const { html, finalUrl } = await fetchWithRedirects(target);
+  if (isLoginUrl(finalUrl)) {
+    const realNoteUrl = extractRedirectPath(finalUrl);
+    if (realNoteUrl) {
+      const retry = await fetchWithRedirects(realNoteUrl);
+      // 重试后仍是登录页 → 该笔记确实需要登录态，交由上层给出明确提示
+      if (!isLoginUrl(retry.finalUrl)) {
+        return retry;
+      }
+      return { html: retry.html, finalUrl: retry.finalUrl, loginRequired: true };
+    }
+    return { html, finalUrl, loginRequired: true };
+  }
+  return { html, finalUrl };
+}
+
+function isLoginUrl(url) {
+  try {
+    const u = new URL(url);
+    return (
+      u.hostname.toLowerCase().includes("xiaohongshu.com") &&
+      /^\/login$/.test(u.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function extractRedirectPath(loginUrl) {
+  try {
+    const u = new URL(loginUrl);
+    const redirect = u.searchParams.get("redirectPath");
+    if (redirect && /^https?:\/\//.test(redirect)) return redirect;
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+async function fetchWithRedirects(target) {
+  // 第一步：请求短链，手动处理重定向
+  let response = await fetch(target, {
+    headers: xhsHeaders(),
+    redirect: "manual",
+  });
+
+  // 手动跟随重定向（最多跟 5 次）
+  let redirectCount = 0;
+  const maxRedirects = 5;
+  while (
+    redirectCount < maxRedirects &&
+    [301, 302, 303, 307, 308].includes(response.status)
+  ) {
+    const location = response.headers.get("location");
+    if (!location) break;
+    const nextUrl = new URL(location, response.url).toString();
+    redirectCount++;
+    response = await fetch(nextUrl, {
+      // 带上 Referer 避免被拦截
+      headers: xhsHeaders({ Referer: response.url }),
+      redirect: "manual",
+    });
+  }
+
+  const html = await response.text();
+  return { html, finalUrl: response.url };
+}
+
+// 安全地获取嵌套属性
+function safeGet(obj, path) {
+  try {
+    return path.split(".").reduce((current, key) => {
+      if (current && typeof current === "object" && key in current) {
+        return current[key];
+      }
+      return null;
+    }, obj);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 新版笔记页：note.currentNoteId + note.noteDetailMap[id].note
+ * 旧版：noteData.data.noteData 等
+ */
+function resolveNotePayload(decoded) {
+  // 新版结构：note.noteDetailMap
+  const noteId = safeGet(decoded, "note.currentNoteId");
+  const detailMap = safeGet(decoded, "note.noteDetailMap");
+  if (noteId && detailMap && typeof detailMap === "object") {
+    const entry = detailMap[noteId];
+    if (entry?.note && typeof entry.note === "object") {
+      return entry.note;
+    }
+    // 有些版本 note 直接挂在 entry 下
+    if (entry && typeof entry === "object" && entry.title) {
+      return entry;
+    }
+  }
+
+  // 旧版结构
+  return (
+    safeGet(decoded, "noteData.data.noteData") ||
+    safeGet(decoded, "note.data") ||
+    safeGet(decoded, "noteDetail.data") ||
+    safeGet(decoded, "data.noteData") ||
+    // 更多兜底路径
+    safeGet(decoded, "note.noteDetailMap")?.[noteId]?.note ||
+    safeGet(decoded, "note.noteDetailMap")?.[noteId] ||
+    safeGet(decoded, "note") ||
+    null
+  );
+}
+
+function extractInitialStateJson(html) {
+  // 取到下一个 </script>，避免对大段 JSON 做错误的非贪婪 `}` 截断
+  const re = /window\.__INITIAL_STATE__\s*=\s*(.*?)<\/script>/is;
+  const m = html.match(re);
+  if (m?.[1]) {
+    return m[1].trim();
+  }
+  // 兼容旧版 script 标签格式
+  const legacy =
+    /<script>\s*window\.__INITIAL_STATE__\s*=\s*([\s\S]*?)<\/script>/i.exec(
+      html
+    );
+  if (legacy?.[1]) {
+    return legacy[1].trim();
+  }
+  // 兼容单行 script 格式
+  const inline =
+    /<script[^>]*>\s*window\.__INITIAL_STATE__\s*=\s*([\s\S]*?)<\/script>/i.exec(
+      html
+    );
+  return inline?.[1]?.trim() ?? null;
+}
+
+/**
+ * 把第三方图片 URL 包成站内代理路径，绕过 Referer 防盗链
+ * （如小红书 sns-webpic 只允许 Referer: xiaohongshu.com）。
+ * 视频不代理（耗资源），仅图片走 /api/image。
+ */
+function proxifyImage(url) {
+  if (!url) return "";
+  return `/api/image?url=${encodeURIComponent(url)}`;
+}
+
+/**
+ * 选取稳定可用的视频直链。
+ * backupUrls 为裸直链（无短时效签名，长期有效），优先使用；
+ * masterUrl 带约 30 分钟签名，仅作兜底。
+ * 统一转 https，避免 https 站点下 http 直链的 mixed content 问题。
+ */
+async function pickStableVideoUrl(entry) {
+  if (!entry || typeof entry !== "object") return null;
+
+  const toHttps = (u) => (u ? u.replace(/^http:/i, "https:") : u);
+
+  const candidates = [];
+  if (Array.isArray(entry.backupUrls)) {
+    for (const u of entry.backupUrls) {
+      if (u) candidates.push(toHttps(u));
+    }
+  }
+  if (entry.masterUrl) candidates.push(toHttps(entry.masterUrl));
+
+  // HEAD 轻量验证可用性（部分 CDN 节点 404，如 bak-v6），取第一个可用的
+  for (const u of candidates) {
+    try {
+      const head = await fetch(u, {
+        method: "HEAD",
+        signal: AbortSignal.timeout(5000),
+      });
+      if (head.ok) return u;
+    } catch {
+      /* try next */
+    }
+  }
+  return null;
+}
+
+async function xhs(url) {
+  try {
+    const { html, finalUrl, loginRequired } = await fetchXhsNoteHtml(url);
+
+    console.log("[xhs] finalUrl:", finalUrl);
+    console.log("[xhs] html length:", html?.length || 0);
+
+    // 已删除/不可见笔记：小红书会把短链重定向到 /explore 并附带 undertake_note_error
+    // 参数（值如「该内容暂时无法查看」）。这是确定失败，直接明确告知已删除，
+    // 不进入页面解析（此时页面里也不会有目标笔记的媒体数据）
+    if (finalUrl.includes("undertake_note_error=")) {
+      return output(404, DELETED_CONTENT_MSG);
+    }
+
+    // 短链被强制跳到登录页且重试真实笔记地址后仍被拦：
+    // 该笔记需要登录态才能查看，明确提示而不是笼统的「数据结构不匹配」
+    if (loginRequired || isLoginUrl(finalUrl)) {
+      console.log("[xhs] 需要登录态，无法解析:", finalUrl);
+      return output(
+        403,
+        "该笔记需要登录小红书后才能查看，暂无法解析，可尝试在 App 内重新分享"
+      );
+    }
+
+    if (!html) {
+      return output(400, "请求失败，未获取到页面内容");
+    }
+
+    // 检查是否被小红书拦截或跳转到了非笔记页
+    if (
+      (finalUrl.includes("xhslink.com") || finalUrl.includes("xhslink.cn")) &&
+      !html.includes("__INITIAL_STATE__")
+    ) {
+      return output(
+        400,
+        "短链重定向失败，请尝试复制小红书 App 内的分享链接"
+      );
+    }
+
+    if (
+      !finalUrl.includes("xiaohongshu.com") &&
+      !html.includes("__INITIAL_STATE__")
+    ) {
+      return output(
+        400,
+        "无法打开小红书笔记页，请确认短链有效或使用 App 分享链接"
+      );
+    }
+
+    let jsonRaw = extractInitialStateJson(html);
+    if (!jsonRaw) {
+      // 尝试打印 HTML 片段帮助调试
+      console.log("[xhs] HTML preview:", html.substring(0, 500));
+      return output(400, "未找到页面数据，小红书可能更新了页面结构");
+    }
+
+    jsonRaw = jsonRaw.replace(/undefined/g, "null");
+
+    let decoded;
+    try {
+      decoded = JSON.parse(jsonRaw);
+    } catch (e) {
+      console.log("[xhs] JSON parse error:", e.message);
+      return output(400, "JSON数据解析失败");
+    }
+
+    if (!decoded || typeof decoded !== "object") {
+      return output(400, "数据格式错误");
+    }
+
+    const noteData = resolveNotePayload(decoded);
+
+    if (!noteData || typeof noteData !== "object") {
+      console.log("[xhs] decoded keys:", Object.keys(decoded));
+      return output(400, "数据结构不匹配，请检查链接是否为有效的小红书内容");
+    }
+
+    // 安全地构建基础数据
+    const data = {
+      author:
+        safeGet(noteData, "user.nickName") ||
+        safeGet(noteData, "user.nickname") ||
+        safeGet(noteData, "user.name") ||
+        "",
+      authorID:
+        safeGet(noteData, "user.userId") || safeGet(noteData, "user.id") || "",
+      title: noteData.title || "",
+      desc: noteData.desc || noteData.description || "",
+      avatar:
+        safeGet(noteData, "user.avatar") ||
+        safeGet(noteData, "user.avatarUrl") ||
+        "",
+    };
+
+    // 检查视频URL
+    let videoUrl = null;
+    const videoStream = safeGet(noteData, "video.media.stream");
+
+    if (videoStream && typeof videoStream === "object") {
+      // h264 优先（浏览器兼容性最好），h265 兜底；均优先取裸直链
+      const h264List = videoStream.h264;
+      if (Array.isArray(h264List) && h264List.length > 0 && h264List[0]) {
+        videoUrl = await pickStableVideoUrl(h264List[0]);
+      }
+      if (!videoUrl) {
+        const h265List = videoStream.h265;
+        if (Array.isArray(h265List) && h265List.length > 0 && h265List[0]) {
+          videoUrl = await pickStableVideoUrl(h265List[0]);
+        }
+      }
+    }
+
+    if (videoUrl) {
+      console.log("[xhs] videoUrl:", videoUrl);
+      // 视频内容
+      data.cover = "";
+      const imageList = noteData.imageList;
+      if (Array.isArray(imageList) && imageList.length > 0 && imageList[0]) {
+        const first = imageList[0];
+        data.cover = proxifyImage(
+          (
+            first.urlDefault ||
+            first.url ||
+            safeGet(first, "infoList.0.url") ||
+            ""
+          ).replace(/^http:/i, "https:")
+        );
+      }
+      data.url = videoUrl;
+      data.type = "video";
+      return output(200, "解析成功", data);
+    }
+
+    // 检查图片内容
+    const imageList = noteData.imageList;
+    if (Array.isArray(imageList) && imageList.length > 0) {
+      const images = [];
+      let cover = "";
+
+      for (let i = 0; i < imageList.length; i++) {
+        const img = imageList[i];
+        if (img && typeof img === "object") {
+          let imageUrl = (
+            img.urlDefault ||
+            img.url ||
+            safeGet(img, "infoList.0.url") ||
+            ""
+          ).replace(/^http:/i, "https:");
+          if (imageUrl) {
+            images.push(proxifyImage(imageUrl));
+            if (i === 0) cover = proxifyImage(imageUrl);
+          }
+        }
+      }
+
+      if (images.length > 0) {
+        data.cover = cover;
+        data.images = images;
+        data.type = "image";
+        return output(200, "解析成功", data);
+      }
+    }
+
+    return output(404, DELETED_CONTENT_MSG);
+  } catch (error) {
+    logger.error("xhs parse error:", error);
+    return output(500, "服务器内部错误");
+  }
+}
+
+const __DEFAULT__ = xhs;
+
+
+module.exports = __DEFAULT__;
 
 });
 
