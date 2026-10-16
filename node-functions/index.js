@@ -249,7 +249,7 @@ const PARSE_TIMEOUT_MS = 20000;
 const PROXY_TIMEOUT_MS = 60000;
 
 const PROXY_TOKEN = '';
-const PARSER_VERSION = '2026.10.16.13';
+const PARSER_VERSION = '2026.10.16.14';
 
 // 本地可解析的平台（其它一律走兜底）
 const DOUYIN_RE = /douyin\.com|iesdouyin\.com|snssdk\.com|wtturl\.cn/i;
@@ -603,11 +603,21 @@ async function handleProxy(req, url) {
   try {
     const upstream = await fetch(mediaUrl.href, { headers, signal: controller.signal });
     clearTimeout(timer);
+
+    // 上游返回错误状态：直接暴露真实状态码，别让小程序里只看到模糊的 net::OK
     if (!upstream.ok && upstream.status !== 206) {
-      throw new HttpError(`上游返回 ${upstream.status}`, 502);
+      throw new HttpError(`上游返回 ${upstream.status}（${host}），直链可能已失效`, 502);
     }
+
+    // 上游 200 但返回的是 HTML/JSON 错误页（部分 CDN 防盗链的行为）：
+    // 当成媒体透传会导致 <video> 报 net::OK 但播不出来，这里直接拦截并说明
+    const ctype = String(upstream.headers.get('content-type') || '').toLowerCase();
+    if (/text\/html|application\/json|application\/xml|text\/plain/.test(ctype)) {
+      throw new HttpError(`上游返回的不是媒体（${ctype}），直链已失效或被防盗链拦截（${host}）`, 502);
+    }
+
     const outHeaders = Object.assign({}, CORS_HEADERS, {
-      'Content-Type': upstream.headers.get('content-type') || 'application/octet-stream',
+      'Content-Type': ctype || 'application/octet-stream',
       'Accept-Ranges': 'bytes',
       'Cache-Control': 'public, max-age=3600',
     });
