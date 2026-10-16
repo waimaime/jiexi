@@ -248,7 +248,7 @@ const PARSE_TIMEOUT_MS = 20000;
 const PROXY_TIMEOUT_MS = 60000;
 
 const PROXY_TOKEN = '';
-const PARSER_VERSION = '2026.10.16.9';
+const PARSER_VERSION = '2026.10.16.10';
 
 // 本地可解析的平台（其它一律走兜底）
 const DOUYIN_RE = /douyin\.com|iesdouyin\.com|snssdk\.com|wtturl\.cn/i;
@@ -267,7 +267,11 @@ const CORS_HEADERS = {
 function json(payload, status = 200) {
   return new Response(JSON.stringify(payload), {
     status,
-    headers: Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, CORS_HEADERS),
+    // no-store：解析结果带时效签名（如 B站 deadline），被 CDN 缓存会返回过期直链
+    headers: Object.assign(
+      { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
+      CORS_HEADERS
+    ),
   });
 }
 
