@@ -245,7 +245,7 @@ const PARSE_TIMEOUT_MS = 20000;
 const PROXY_TIMEOUT_MS = 60000;
 
 const PROXY_TOKEN = '';
-const PARSER_VERSION = '2026.10.16.4';
+const PARSER_VERSION = '2026.10.16.5';
 
 // 本地可解析的平台（其它一律走兜底）
 const DOUYIN_RE = /douyin\.com|iesdouyin\.com|snssdk\.com|wtturl\.cn/i;
@@ -518,16 +518,19 @@ async function handleParse(req, url) {
   const shareUrl = extractUrl(text) || text;
   if (!shareUrl) throw new HttpError('请先粘贴分享链接', 400);
 
-  // 1) 本地解析（抖音 / B站）
+  // 并发解析：本地解析器与兜底源同时发起，谁先成功用谁（本地优先）。
+  // 参考竞品做法——多源同时跑，只把成功的结果呈现出来；串行会白等一个源超时。
+  const isReliableLocal = DOUYIN_RE.test(shareUrl) || BILIBILI_RE.test(shareUrl);
+  const fallbackPromise = isReliableLocal ? null : parseFallback(shareUrl).catch(() => null);
+
   try {
     const local = await parseLocal(shareUrl);
     if (local) return json({ ok: true, data: local, _source: 'local' });
   } catch (e) {
-    // 本地失败，静默降级到兜底源
+    // 本地失败，静默降级
   }
 
-  // 2) 兜底源（小红书 / 快手 / 其它，或本地失败时）
-  const remote = await parseFallback(shareUrl);
+  const remote = fallbackPromise ? await fallbackPromise : await parseFallback(shareUrl);
   if (remote) return json({ ok: true, data: remote, _source: 'fallback' });
 
   throw new HttpError('解析失败，请稍后重试或反馈该链接', 502);
@@ -2455,7 +2458,6 @@ const __handler = {
 export const onRequest = async (context) => {
   const { request, env } = context;
   try {
-    // 把 EdgeOne 环境变量透传进去（BILI_SESSDATA / XHS_COOKIE 等）
     return await __handler.fetch(request, env || {});
   } catch (err) {
     return new Response(JSON.stringify({ ok: false, code: 500, message: String((err && err.message) || err) }), {
