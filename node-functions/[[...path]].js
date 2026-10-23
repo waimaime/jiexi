@@ -249,7 +249,7 @@ const PARSE_TIMEOUT_MS = 20000;
 const PROXY_TIMEOUT_MS = 60000;
 
 const PROXY_TOKEN = '';
-const PARSER_VERSION = '2026.10.16.15';
+const PARSER_VERSION = '2026.10.23.1';
 
 // 本地可解析的平台（其它一律走兜底）
 const DOUYIN_RE = /douyin\.com|iesdouyin\.com|snssdk\.com|wtturl\.cn/i;
@@ -699,8 +699,118 @@ function normalizePath(pathname) {
 
 /** 审核模式开关：由 EdgeOne 环境变量 REVIEW_MODE 控制（true/1 开启） */
 function isReviewMode() {
+
   const raw = String((typeof process !== 'undefined' && process.env && process.env.REVIEW_MODE) || '');
   return /^(true|1|yes|on)$/i.test(raw.trim());
+}
+
+/* ==================== 微信内容安全 API ==================== */
+// 小程序审核要求：UGC/图片处理功能必须接入 security.imgSecCheck / msgSecCheck。
+// 需要 EdgeOne 环境变量：WX_APPID、WX_SECRET。
+
+const WX_APPID = () => String((process.env && process.env.WX_APPID) || '').trim();
+const WX_SECRET = () => String((process.env && process.env.WX_SECRET) || '').trim();
+
+// access_token 模块级缓存（EdgeOne 函数实例复用时生效，提前 5 分钟过期刷新）
+let __wxTokenCache = { token: '', expiresAt: 0 };
+
+async function getWxAccessToken() {
+  if (!WX_APPID() || !WX_SECRET()) {
+    throw new HttpError('服务端未配置 WX_APPID / WX_SECRET', 500);
+  }
+  const now = Date.now();
+  if (__wxTokenCache.token && now < __wxTokenCache.expiresAt) return __wxTokenCache.token;
+  const u = `https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid=${encodeURIComponent(WX_APPID())}&secret=${encodeURIComponent(WX_SECRET())}`;
+  const r = await fetch(u);
+  const j = await r.json().catch(() => ({}));
+  if (!j.access_token) {
+    throw new HttpError(`获取微信 access_token 失败：${j.errmsg || j.errcode || '未知错误'}`, 502);
+  }
+  __wxTokenCache = { token: j.access_token, expiresAt: now + (Number(j.expires_in || 7200) - 300) * 1000 };
+  return j.access_token;
+}
+
+/** code2session：用 wx.login 的 code 换 openid */
+async function handleSecuritySession(req) {
+  let body = {};
+  try { body = await req.json(); } catch (e) { /* ignore */ }
+  const code = String((body && body.code) || '').trim();
+  if (!code) throw new HttpError('缺少 code', 400);
+  if (!WX_APPID() || !WX_SECRET()) throw new HttpError('服务端未配置 WX_APPID / WX_SECRET', 500);
+  const u = `https://api.weixin.qq.com/sns/jscode2session?appid=${encodeURIComponent(WX_APPID())}&secret=${encodeURIComponent(WX_SECRET())}&js_code=${encodeURIComponent(code)}&grant_type=authorization_code`;
+  const r = await fetch(u);
+  const j = await r.json().catch(() => ({}));
+  if (!j.openid) throw new HttpError(`微信登录失败：${j.errmsg || j.errcode || '未知错误'}`, 502);
+  return { ok: true, data: { openid: j.openid } };
+}
+
+/**
+ * 图片安全检测：小程序 wx.uploadFile 上传（multipart，字段名 media），
+ * 服务端转发给微信 imgSecCheck。返回 { ok, risky, label }。
+ */
+async function handleImgSecCheck(req) {
+  const token = await getWxAccessToken();
+  // 解析客户端上传的 multipart 表单
+  const form = await req.formData();
+  const file = form.get('media') || form.get('file');
+  if (!file || typeof file.arrayBuffer !== 'function') {
+    throw new HttpError('缺少图片文件（字段名 media）', 400);
+  }
+  const buf = Buffer.from(await file.arrayBuffer());
+  if (!buf.length) throw new HttpError('图片内容为空', 400);
+  if (buf.length > 10 * 1024 * 1024) throw new HttpError('图片超过 10MB 限制', 400);
+  const fname = String(file.name || 'image.jpg').replace(/[^\w.\-]/g, '_');
+  const ctype = file.type || 'image/jpeg';
+
+  // 手动拼 multipart/form-data 转发给微信
+  const boundary = '----wbsec' + Math.random().toString(36).slice(2);
+  const head = Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="media"; filename="${fname}"\r\nContent-Type: ${ctype}\r\n\r\n`
+  );
+  const tail = Buffer.from(`\r\n--${boundary}--\r\n`);
+  const payload = Buffer.concat([head, buf, tail]);
+
+  const r = await fetch(`https://api.weixin.qq.com/wxa/img_sec_check?access_token=${token}`, {
+    method: 'POST',
+    headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+    body: payload,
+  });
+  const j = await r.json().catch(() => ({}));
+  // errcode: 0 正常；87014 内容违规；其他按失败处理（但不误判为违规）
+  if (j.errcode === 87014) {
+    return { ok: true, data: { risky: true, errcode: 87014 } };
+  }
+  if (j.errcode === 0) {
+    return { ok: true, data: { risky: false, errcode: 0 } };
+  }
+  // token 失效时清缓存，下次重试
+  if (j.errcode === 40001 || j.errcode === 42001) __wxTokenCache = { token: '', expiresAt: 0 };
+  throw new HttpError(`微信图片检测接口异常：${j.errmsg || j.errcode || r.status}`, 502);
+}
+
+/** 文本安全检测（v2，需 openid） */
+async function handleMsgSecCheck(req) {
+  let body = {};
+  try { body = await req.json(); } catch (e) { /* ignore */ }
+  const content = String((body && body.content) || '');
+  const openid = String((body && body.openid) || '').trim();
+  if (!content.trim()) return { ok: true, data: { risky: false } };
+  if (!openid) throw new HttpError('缺少 openid', 400);
+  const token = await getWxAccessToken();
+  const r = await fetch(`https://api.weixin.qq.com/wxa/msg_sec_check?access_token=${token}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ openid, scene: 2, version: 2, content: content.slice(0, 2500) }),
+  });
+  const j = await r.json().catch(() => ({}));
+  // v2：errcode 0 且 result.suggest === 'pass' 为通过
+  if (j.errcode === 0) {
+    const suggest = j.result && j.result.suggest;
+    return { ok: true, data: { risky: suggest === 'risky', suggest: suggest || 'pass', label: (j.detail && j.detail[0] && j.detail[0].label) || 0 } };
+  }
+  if (j.errcode === 87014) return { ok: true, data: { risky: true, suggest: 'risky' } };
+  if (j.errcode === 40001 || j.errcode === 42001) __wxTokenCache = { token: '', expiresAt: 0 };
+  throw new HttpError(`微信文本检测接口异常：${j.errmsg || j.errcode || r.status}`, 502);
 }
 
 async function handle(req, context) {
@@ -725,6 +835,8 @@ async function handle(req, context) {
           // 审核模式：EdgeOne 环境变量 REVIEW_MODE=true 时，小程序启动直接进
           // 涂抹去水印页（不显示解析首页）；审核通过后改成 false，无需发新版。
           reviewMode: isReviewMode(),
+          // 内容安全能力是否已配置（小程序据此决定是否调用检测接口）
+          securityEnabled: !!(WX_APPID() && WX_SECRET()),
           platforms: [
             { platform: 'douyin', platformName: '抖音', enabled: true, notice: '' },
             { platform: 'bilibili', platformName: '哔哩哔哩', enabled: true, notice: '' },
@@ -733,6 +845,17 @@ async function handle(req, context) {
           ],
         },
       });
+    }
+    // ---- 微信内容安全 API（小程序审核要求：图片处理需接入 imgSecCheck）----
+    // 环境变量：WX_APPID / WX_SECRET（小程序后台「开发管理-开发设置」里取）
+    if (pathname === '/api/security/session' && req.method === 'POST') {
+      return json(await handleSecuritySession(req));
+    }
+    if (pathname === '/api/security/img-check' && req.method === 'POST') {
+      return json(await handleImgSecCheck(req));
+    }
+    if (pathname === '/api/security/msg-check' && req.method === 'POST') {
+      return json(await handleMsgSecCheck(req));
     }
     if (pathname === '/api/debug/review') {
       return json({
